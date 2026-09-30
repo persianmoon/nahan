@@ -8958,6 +8958,31 @@ function getEffectivePips(p) {
 // manual field segManual (classic "a-b,c-d,packets" OR finalmask JSON),
 // TLS mask field tlsMask (colon-separated TLS_* cipher list).
 // All helpers are fail-open: invalid input yields null (link built plain).
+const STATIC_FINAL_MASK = {
+    tcp: [
+        {
+            type: "fragment",
+            settings: {
+                packets: "tlshello",
+                lengths: ["0", "104", "1"],
+                delays: ["0"],
+                maxSplit: "0"
+            }
+        },
+        {
+            type: "fragment",
+            settings: {
+                packets: "1-1",
+                lengths: ["114", "1"],
+                delays: ["1"],
+                maxSplit: "11"
+            }
+        }
+    ]
+};
+
+
+
 function parseSegRangeList(s, maxItems) {
     try {
         const items = String(s || "")
@@ -9037,26 +9062,21 @@ function resolveSegFragment(p) {
     }
 }
 function buildSegFragmentParam(p) {
-    // Returns "" or "&fragment=..." / "&fm=..." (already encoded).
     try {
-        const r = resolveSegFragment(p);
-        if (!r) return "";
-        if (r.kind === "fm")
-            return "&fm=" + encodeURIComponent(JSON.stringify(r.value));
-        return "&fragment=" + encodeURIComponent(String(r.value));
+        return "&fm=" + encodeURIComponent(
+            JSON.stringify({
+                tcp: STATIC_FINAL_MASK.tcp
+            })
+        );
     } catch (e) {
         return "";
     }
 }
 function getSegStreamExtra(p) {
-    // Xray streamSettings object for vjson builder: { finalmask } | { fragment } | {}.
+    // Xray streamSettings finalmask.
     try {
-        const r = resolveSegFragment(p);
-        if (!r) return {};
-        if (r.kind === "fm") return { finalmask: r.value };
-        const m = String(r.value).split(",");
         return {
-            fragment: { packets: m[2], length: m[0], interval: m[1] },
+            finalmask: STATIC_FINAL_MASK
         };
     } catch (e) {
         return {};
