@@ -170,7 +170,7 @@ const SYSTEM_DEFAULTS = {
     // Sepidar-grade hardening flags (safe defaults; merged, never wiped).
     maintenanceMode: false,
     allowRemoteDeploy: true,
-    autoPruneRelays: true,
+    autoPruneRelays: false, // diagnostic-safe: do not automatically remove relays
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -1247,7 +1247,13 @@ export default {
 
             return new Response(null, { status: 404 });
         } catch (err) {
-            return new Response(null, { status: 404 });
+            try {
+                console.error("[worker-fetch-error]", err && err.stack ? err.stack : String(err));
+            } catch (e) {}
+            return new Response("Worker runtime error", {
+                status: 500,
+                headers: { "Content-Type": "text/plain; charset=utf-8" },
+            });
         } finally {
             try {
                 INFLIGHT_HTTP = Math.max(0, INFLIGHT_HTTP - 1);
@@ -7199,14 +7205,10 @@ function collectRelayInventory() {
     return Array.from(out.values());
 }
 function pruneAutomationOff() {
-    try {
-        const v = sysConfig.autoPruneRelays;
-        if (v === undefined || v === null) return false;
-        const s = String(v).trim().toLowerCase();
-        return s === "0" || s === "off" || s === "no" || s === "false";
-    } catch (e) {
-        return false;
-    }
+    // Diagnostic-safe build:
+    // Completely disable active relay probing/burial so a transient Cloudflare
+    // socket restriction or slow relay cannot mutate/delete live relay lists.
+    return true;
 }
 let RELAY_SNAPSHOT_LOADED = false;
 async function loadRelayHealthSnapshot(env) {
