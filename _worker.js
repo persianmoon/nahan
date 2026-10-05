@@ -6,6 +6,7 @@ import { connect } from "cloudflare:sockets";
  */
 
 const CURRENT_VERSION = "3.0.4";
+const FIXED_ECH_CONFIG_LIST = "cloudflare-ech.com+udp://1.1.1.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -170,7 +171,7 @@ const SYSTEM_DEFAULTS = {
     // Sepidar-grade hardening flags (safe defaults; merged, never wiped).
     maintenanceMode: false,
     allowRemoteDeploy: true,
-    autoPruneRelays: false, // diagnostic-safe: do not automatically remove relays
+    autoPruneRelays: true,
 };
 
 let sysConfig = { ...SYSTEM_DEFAULTS };
@@ -1247,13 +1248,7 @@ export default {
 
             return new Response(null, { status: 404 });
         } catch (err) {
-            try {
-                console.error("[worker-fetch-error]", err && err.stack ? err.stack : String(err));
-            } catch (e) {}
-            return new Response("Worker runtime error", {
-                status: 500,
-                headers: { "Content-Type": "text/plain; charset=utf-8" },
-            });
+            return new Response(null, { status: 404 });
         } finally {
             try {
                 INFLIGHT_HTTP = Math.max(0, INFLIGHT_HTTP - 1);
@@ -7205,10 +7200,14 @@ function collectRelayInventory() {
     return Array.from(out.values());
 }
 function pruneAutomationOff() {
-    // Diagnostic-safe build:
-    // Completely disable active relay probing/burial so a transient Cloudflare
-    // socket restriction or slow relay cannot mutate/delete live relay lists.
-    return true;
+    try {
+        const v = sysConfig.autoPruneRelays;
+        if (v === undefined || v === null) return false;
+        const s = String(v).trim().toLowerCase();
+        return s === "0" || s === "off" || s === "no" || s === "false";
+    } catch (e) {
+        return false;
+    }
 }
 let RELAY_SNAPSHOT_LOADED = false;
 async function loadRelayHealthSnapshot(env) {
@@ -8960,31 +8959,6 @@ function getEffectivePips(p) {
 // manual field segManual (classic "a-b,c-d,packets" OR finalmask JSON),
 // TLS mask field tlsMask (colon-separated TLS_* cipher list).
 // All helpers are fail-open: invalid input yields null (link built plain).
-const STATIC_FINAL_MASK = {
-    tcp: [
-        {
-            type: "fragment",
-            settings: {
-                packets: "tlshello",
-                lengths: ["0", "104", "1"],
-                delays: ["0"],
-                maxSplit: "0"
-            }
-        },
-        {
-            type: "fragment",
-            settings: {
-                packets: "1-1",
-                lengths: ["114", "1"],
-                delays: ["1"],
-                maxSplit: "11"
-            }
-        }
-    ]
-};
-
-
-
 function parseSegRangeList(s, maxItems) {
     try {
         const items = String(s || "")
@@ -9064,21 +9038,26 @@ function resolveSegFragment(p) {
     }
 }
 function buildSegFragmentParam(p) {
+    // Returns "" or "&fragment=..." / "&fm=..." (already encoded).
     try {
-        return "&fm=" + encodeURIComponent(
-            JSON.stringify({
-                tcp: STATIC_FINAL_MASK.tcp
-            })
-        );
+        const r = resolveSegFragment(p);
+        if (!r) return "";
+        if (r.kind === "fm")
+            return "&fm=" + encodeURIComponent(JSON.stringify(r.value));
+        return "&fragment=" + encodeURIComponent(String(r.value));
     } catch (e) {
         return "";
     }
 }
 function getSegStreamExtra(p) {
-    // Xray streamSettings finalmask.
+    // Xray streamSettings object for vjson builder: { finalmask } | { fragment } | {}.
     try {
+        const r = resolveSegFragment(p);
+        if (!r) return {};
+        if (r.kind === "fm") return { finalmask: r.value };
+        const m = String(r.value).split(",");
         return {
-            finalmask: STATIC_FINAL_MASK
+            fragment: { packets: m[2], length: m[0], interval: m[1] },
         };
     } catch (e) {
         return {};
@@ -9349,6 +9328,7 @@ async function buildUriProfile(
             effectivePorts.forEach((port) => {
                 let sec = getTransportParams(port);
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
+                if (sec === "tls") extBase += `&ech=${encodeURIComponent(FIXED_ECH_CONFIG_LIST)}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
                 // Per-user segmentation (fragment/finalmask) + TLS mask.
@@ -9408,6 +9388,7 @@ async function buildUriProfile(
                         };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                         let trojanExtBase = `security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr)}`;
+                        if (sec === "tls") trojanExtBase += `&ech=${encodeURIComponent(FIXED_ECH_CONFIG_LIST)}`;
                         if (sysConfig.enableOpt2)
                             trojanExtBase += `&pbk=enabled`;
                         trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
@@ -9477,6 +9458,7 @@ async function buildUriProfile(
                             let pathStrTr2 =
                                 "/" + btoa(JSON.stringify(payloadTr2));
                             let trojanExtBase2 = `security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr2)}`;
+                            if (sec === "tls") trojanExtBase2 += `&ech=${encodeURIComponent(FIXED_ECH_CONFIG_LIST)}`;
                             if (sysConfig.enableOpt2)
                                 trojanExtBase2 += `&pbk=enabled`;
                             trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
@@ -10629,7 +10611,7 @@ async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = fal
                                 streamSettings: {
                                     network: "ws",
                                     security: sec,
-                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
+                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure, echConfigList: FIXED_ECH_CONFIG_LIST } : undefined,
                                     wsSettings: { path: path, headers: { Host: hName } },
                                     ...getSegStreamExtra(p)
                                 }
@@ -10652,7 +10634,7 @@ async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = fal
                                 streamSettings: {
                                     network: "ws",
                                     security: sec,
-                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure } : undefined,
+                                    tlsSettings: sec === "tls" ? { serverName: hName, allowInsecure: allowInsecure, echConfigList: FIXED_ECH_CONFIG_LIST } : undefined,
                                     wsSettings: { path: path, headers: { Host: hName } },
                                     ...getSegStreamExtra(p)
                                 }
